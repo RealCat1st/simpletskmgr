@@ -27,6 +27,7 @@ fi
 BIN="$PREFIX/bin"
 APPS="$PREFIX/share/applications"
 ICONS="$PREFIX/share/icons/hicolor/scalable/apps"
+ICONS_PNG="$PREFIX/share/icons/hicolor/256x256/apps"
 
 info() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$1"; }
@@ -35,12 +36,20 @@ fail() { printf '\033[1;31mError:\033[0m %s\n' "$1" >&2; exit 1; }
 refresh_menu() {
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$APPS" 2>/dev/null || true
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
+    touch "$PREFIX/share/icons/hicolor" 2>/dev/null || true
+    # KDE Plasma caches menu entries and icons
+    if [ "$(id -u)" -ne 0 ]; then
+        for k in kbuildsycoca6 kbuildsycoca5; do
+            command -v "$k" >/dev/null 2>&1 && { "$k" >/dev/null 2>&1 || true; break; }
+        done
+    fi
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
     for p in "$HOME/.local" /usr/local; do
         for f in "$p/bin/$NAME" "$p/share/applications/$NAME.desktop" \
-                 "$p/share/icons/hicolor/scalable/apps/$NAME.svg"; do
+                 "$p/share/icons/hicolor/scalable/apps/$NAME.svg" \
+                 "$p/share/icons/hicolor/256x256/apps/$NAME.png"; do
             [ -e "$f" ] && rm -f "$f" && info "Removed $f"
         done
         # remove the alias only if it is ours
@@ -80,14 +89,18 @@ info "Downloading SimpleTskMgr..."
 fetch "$BASE/simpletskmgr.py" "$TMP/$NAME"
 fetch "$BASE/data/simpletskmgr.desktop" "$TMP/$NAME.desktop"
 fetch "$BASE/data/simpletskmgr.svg" "$TMP/$NAME.svg"
+fetch "$BASE/data/simpletskmgr.png" "$TMP/$NAME.png"
 python3 -m py_compile "$TMP/$NAME" 2>/dev/null || fail "Downloaded file is invalid."
 
-mkdir -p "$BIN" "$APPS" "$ICONS"
+mkdir -p "$BIN" "$APPS" "$ICONS" "$ICONS_PNG"
 install -m 755 "$TMP/$NAME" "$BIN/$NAME"
-# absolute Exec path so the menu entry works even if $BIN is not in PATH
-sed "s|^Exec=.*|Exec=$BIN/$NAME|" "$TMP/$NAME.desktop" > "$APPS/$NAME.desktop"
-chmod 644 "$APPS/$NAME.desktop"
 install -m 644 "$TMP/$NAME.svg" "$ICONS/$NAME.svg"
+install -m 644 "$TMP/$NAME.png" "$ICONS_PNG/$NAME.png"
+# absolute Exec and Icon paths: work even if $BIN is not in PATH and
+# without relying on the desktop's icon cache (KDE, GNOME, XFCE, ...)
+sed -e "s|^Exec=.*|Exec=$BIN/$NAME|" -e "s|^Icon=.*|Icon=$ICONS_PNG/$NAME.png|" \
+    "$TMP/$NAME.desktop" > "$APPS/$NAME.desktop"
+chmod 644 "$APPS/$NAME.desktop"
 refresh_menu
 info "Installed $BIN/$NAME"
 info "Added start-menu entry \"SimpleTskMgr\""
