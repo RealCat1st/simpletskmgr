@@ -7,12 +7,14 @@ colored ring gauges for **CPU**, **GPU** and **memory**.
 
 - Ring gauges for CPU, GPU and RAM usage (green → yellow → red)
 - Per-core CPU bars with usage history
-- GPU: NVIDIA (via `nvidia-smi`), AMD (via `amdgpu` sysfs), others detected
+- GPU: NVIDIA (via `nvidia-smi`), AMD (`amdgpu`), Intel Arc / iGPU (`xe` and `i915`, e.g. Arc B580) — usage, VRAM, temperature, power
+- GPU usage per process (Intel and AMD)
 - NPU: Intel NPU (`intel_vpu`) usage, AMD XDNA detected
 - Swap, VRAM, network and disk I/O throughput
 - Disk usage for all mounted filesystems
 - Process list with readable app names (Flatpak apps, Wine, Python/Node/Java scripts) — sort by CPU, memory, PID or name, terminate or kill processes
-- Live process search
+- Live process search, group processes by app, detailed process view
+- Mouse support
 - Built-in update check
 - **Zero dependencies**: a single Python file that reads `/proc` and `/sys` directly
 
@@ -62,14 +64,20 @@ Run with `sudo` to be able to kill processes of other users.
 | Key | Action |
 |---|---|
 | `/` | Search processes by name, command, PID or user (`Enter` keep filter, `Esc` clear) |
+| `g` | Group processes by app (Firefox, Discord, Steam, ...) |
+| `Enter` | Process details · expand/collapse a group |
+| `→` `←` `Space` | Expand / collapse group |
 | `c` / `m` / `p` / `n` | Sort by CPU / memory / PID / name |
 | `r` | Reverse sort order |
-| `↑` `↓` `PgUp` `PgDn` `Home` | Select process |
-| `k` | Terminate selected process (SIGTERM) |
-| `K` | Force kill selected process (SIGKILL) |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | Select process |
+| `k` | Terminate selected process or group (SIGTERM) – asks for confirmation |
+| `K` | Force kill selected process or group (SIGKILL) – asks for confirmation |
 | `+` / `-` | Slower / faster refresh |
 | `u` | Install update (shown when a new version is available) |
 | `q` | Quit |
+
+**Mouse:** click a process to select it, double-click for details, click a column header to sort,
+scroll with the wheel, click the keys in the footer.
 
 ### Updates
 

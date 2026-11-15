@@ -9,9 +9,13 @@ Keys:
   p / n    Sort by PID / name
   r        Reverse sort order
   ↑ ↓      Select process      PgUp/PgDn  page
-  k        Terminate selected process (SIGTERM),  K = SIGKILL
+  k        Terminate selected process/group (SIGTERM),  K = SIGKILL – asks first
   + / -    Change refresh interval
   /        Search processes (Enter = keep filter, Esc = clear)
+  g        Group processes by app (→/← or Space to expand/collapse)
+  Enter    Process details (or expand group)
+  Mouse    Click to select, double-click for details, click headers to sort,
+           wheel to scroll, click footer keys
   u        Install available update
 
 Set STM_NO_UPDATE_CHECK=1 to disable the update check on start.
@@ -29,7 +33,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REPO = "RealCat1st/simpletskmgr"
 RAW_URL = f"https://raw.githubusercontent.com/{REPO}/main/simpletskmgr.py"
 IN_SNAP = bool(os.environ.get("SNAP"))  # snaps update themselves via "snap refresh"
@@ -116,46 +120,219 @@ def meminfo():
     }
 
 
+INTEL_NAMES = {  # fallback if lspci is not installed
+    "0xe20b": "Intel Arc B580", "0xe20c": "Intel Arc B570",
+    "0x56a0": "Intel Arc A770", "0x56a1": "Intel Arc A750", "0x56a5": "Intel Arc A380",
+    "0x56a6": "Intel Arc A310",
+}
+UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
+
+
+def to_bytes(v):
+    parts = v.split()
+    try:
+        return int(parts[0]) * UNITS.get(parts[1] if len(parts) > 1 else "B", 1)
+    except (ValueError, IndexError):
+        return 0
+
+
+def parse_fdinfo(text):
+    """Parse a DRM fdinfo block (i915, xe, amdgpu, nouveau, msm, ...).
+    Returns (client_key, engines{name: (busy, total|None)}, capacity{name: n}, vram_bytes) or None."""
+    d = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        d[k.strip()] = v.strip()
+    if "drm-client-id" not in d:
+        return None
+    key = (d.get("drm-pdev", ""), d["drm-client-id"])
+    cap, eng, vram = {}, {}, 0
+    for k, v in d.items():
+        if k.startswith("drm-engine-capacity-"):
+            try:
+                cap[k[20:]] = max(1, int(v.split()[0]))
+            except ValueError:
+                pass
+    for k, v in d.items():
+        try:
+            if k.startswith("drm-engine-") and not k.startswith("drm-engine-capacity-"):
+                eng[k[11:]] = (int(v.split()[0]), None)  # busy time in ns (i915, amdgpu)
+            elif k.startswith("drm-cycles-"):  # xe: busy cycles vs. total cycles
+                tot = d.get("drm-total-cycles-" + k[11:])
+                if tot:
+                    eng[k[11:]] = (int(v.split()[0]), int(tot.split()[0]))
+            elif k.startswith(("drm-resident-vram", "drm-resident-local", "drm-memory-vram")):
+                vram += to_bytes(v)
+        except ValueError:
+            pass
+    return key, eng, cap, vram
+
+
+class GpuClients:
+    """GPU usage per process and per device from /proc/<pid>/fdinfo.
+    Works for Intel (i915 + xe, e.g. Arc B580), AMD and others. Only processes
+    we may inspect are counted (all of them when running as root)."""
+
+    def __init__(self):
+        self.prev = {}
+        self.per_pid = {}
+        self.per_dev = {}
+
+    def update(self):
+        now = time.monotonic()
+        cur = {}
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fddir = f"/proc/{pid}/fd"
+            try:
+                fds = os.listdir(fddir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    if not os.readlink(f"{fddir}/{fd}").startswith("/dev/dri/"):
+                        continue
+                except OSError:
+                    continue
+                r = parse_fdinfo(read(f"/proc/{pid}/fdinfo/{fd}"))
+                if r and r[0] not in cur:
+                    cur[r[0]] = (int(pid), now) + r[1:]
+        per_pid, dev_eng, dev_vram = {}, {}, {}
+        for key, (pid, t, eng, cap, vram) in cur.items():
+            pdev = key[0]
+            dev_vram[pdev] = dev_vram.get(pdev, 0) + vram
+            dev_eng.setdefault(pdev, {})
+            prev = self.prev.get(key)
+            if not prev:
+                continue
+            _, pt, peng, _, _ = prev
+            best = 0.0
+            for e, (busy, tot) in eng.items():
+                if e not in peng:
+                    continue
+                pb, ptot = peng[e]
+                c = cap.get(e, 1)
+                if tot is not None and ptot is not None:
+                    span = tot - ptot
+                else:
+                    span = (t - pt) * 1e9
+                u = (busy - pb) / span * 100 / c if span > 0 else 0.0
+                u = max(0.0, min(100.0, u))
+                dev_eng[pdev][e] = dev_eng[pdev].get(e, 0.0) + u
+                best = max(best, u)
+            per_pid[pid] = per_pid.get(pid, 0.0) + best
+        self.prev = cur
+        self.per_pid = per_pid
+        self.per_dev = {p: {"util": min(100.0, max(e.values())) if e else 0.0, "vram": dev_vram.get(p, 0)}
+                        for p, e in dev_eng.items()}
+
+
 class GPU:
-    """NVIDIA (nvidia-smi), AMD (amdgpu sysfs), Intel/sonstige (nur Erkennung)."""
+    """NVIDIA (nvidia-smi), AMD (amdgpu sysfs), Intel i915/xe (fdinfo + sysfs)."""
 
     def __init__(self):
         self.has_nvsmi = shutil.which("nvidia-smi") is not None
         self.last_nv = []
         self.last_nv_t = 0
+        self.names = {}
+        self.energy = {}
+        self.clients = GpuClients()
+
+    def _name(self, card, dev, driver):
+        pdev = os.path.basename(os.path.realpath(dev))
+        if pdev in self.names:
+            return self.names[pdev]
+        name = None
+        if shutil.which("lspci"):
+            try:
+                out = subprocess.run(["lspci", "-mm", "-s", pdev], capture_output=True,
+                                     text=True, timeout=2).stdout
+                f = re.findall(r'"([^"]*)"', out)
+                if len(f) >= 3:
+                    vendor = f[1].split()[0] if f[1] else ""
+                    m = re.search(r"\[([^\]]+)\]", f[2])  # "Battlemage G21 [Arc B580]" -> "Arc B580"
+                    name = f"{vendor} {m.group(1) if m else f[2]}".strip()
+            except Exception:
+                pass
+        if not name:
+            name = INTEL_NAMES.get(read(dev + "/device").strip(), f"{os.path.basename(card)} ({driver})")
+        self.names[pdev] = name
+        return name
+
+    def _power(self, dev, key):
+        for hw in glob.glob(dev + "/hwmon/hwmon*"):
+            for f in ("power1_average", "power1_input"):
+                v = read(f"{hw}/{f}").strip()
+                if v and int(v) > 0:
+                    return int(v) / 1e6
+            v = read(hw + "/energy1_input").strip()  # µJ counter (Intel xe / i915)
+            if v:
+                e, t = int(v), time.monotonic()
+                prev = self.energy.get(key)
+                self.energy[key] = (e, t)
+                if prev and t > prev[1]:
+                    return max(0.0, (e - prev[0]) / 1e6 / (t - prev[1]))
+        return None
 
     def info(self):
+        self.clients.update()
         gpus = []
         if self.has_nvsmi:
             if time.time() - self.last_nv_t > 1.5:
                 try:
                     out = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                        ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
                          "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2).stdout
                     self.last_nv = []
                     for line in out.strip().splitlines():
-                        n, u, mu, mt, t = [x.strip() for x in line.split(",")]
+                        n, u, mu, mt, t, pw = ([x.strip() for x in line.split(",")] + ["", ""])[:6]
                         self.last_nv.append({"name": n, "util": float(u), "mem_used": float(mu) * 2**20,
-                                             "mem_total": float(mt) * 2**20, "temp": float(t)})
+                                             "mem_total": float(mt) * 2**20, "temp": float(t),
+                                             "power": float(pw) if pw.replace(".", "").isdigit() else None})
                 except Exception:
                     pass
                 self.last_nv_t = time.time()
             gpus += self.last_nv
-        for card in sorted(glob.glob("/sys/class/drm/card[0-9]")):
+        for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+            if "-" in os.path.basename(card):
+                continue  # connectors like card1-HDMI-A-1
             dev = card + "/device"
             driver = os.path.basename(os.path.realpath(dev + "/driver")) if os.path.exists(dev + "/driver") else "?"
             if driver == "nvidia" and self.has_nvsmi:
                 continue
-            g = {"name": f"{os.path.basename(card)} ({driver})", "util": None,
-                 "mem_used": None, "mem_total": None, "temp": None}
+            pdev = os.path.basename(os.path.realpath(dev))
+            g = {"name": self._name(card, dev, driver), "util": None, "mem_used": None,
+                 "mem_total": None, "temp": None, "power": None, "driver": driver}
             busy = read(dev + "/gpu_busy_percent").strip()
+            fd = self.clients.per_dev.get(pdev)
             if busy:
                 g["util"] = float(busy)
+            elif driver in ("xe", "i915"):
+                g["util"] = fd["util"] if fd else 0.0
             mu, mt = read(dev + "/mem_info_vram_used").strip(), read(dev + "/mem_info_vram_total").strip()
             if mu and mt:
                 g["mem_used"], g["mem_total"] = int(mu), int(mt)
-            for hw in glob.glob(dev + "/hwmon/hwmon*/temp1_input"):
-                g["temp"] = int(read(hw, "0")) / 1000
+            elif driver in ("xe", "i915"):
+                total = 0
+                for f in glob.glob(dev + "/tile*/physical_vram_size_bytes") + glob.glob(dev + "/lmem_total_bytes"):
+                    try:
+                        total += int(read(f, "0").strip() or 0)
+                    except ValueError:
+                        pass
+                if total:
+                    g["mem_total"] = total
+                    g["mem_used"] = fd["vram"] if fd else 0
+            temps = []
+            for t in sorted(glob.glob(dev + "/hwmon/hwmon*/temp*_input")):
+                try:
+                    temps.append(int(read(t, "0").strip() or 0) / 1000)
+                except ValueError:
+                    pass
+            temps = [t for t in temps if 0 < t < 150]
+            if temps:
+                g["temp"] = max(temps)
+            g["power"] = self._power(dev, pdev)
             gpus.append(g)
         return gpus
 
@@ -417,6 +594,9 @@ class App:
         self.msg, self.msg_t = "", 0
         self.plist, self.history, self.all = [], [], []
         self.query, self.searching = "", False
+        self.grouped, self.expanded, self.rows = False, set(), []
+        self.detail, self.confirm = None, None
+        self.hits, self.last_click, self.page, self.follow_top = [], (-1, 0.0), 10, True
         self.new_version = None
         self.restart = False
         if not os.environ.get("STM_NO_UPDATE_CHECK") and not IN_SNAP:
@@ -433,6 +613,11 @@ class App:
         scr.nodelay(True)
         scr.idlok(False)  # no line-scroll optimisation -> no ghost lines
         scr.keypad(True)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
 
     # ── updates ──
     @staticmethod
@@ -605,9 +790,18 @@ class App:
         self.history.append(self.cpu.usage[0])
         self.history = self.history[-300:]
         procs = self.procs.update(self.cpu.total_jiffies, len(self.cpu.usage) - 1, self.mem["total"])
-        key = self.sort
-        procs.sort(key=lambda p: (p[key].lower() if key == "name" else p[key]), reverse=self.rev)
+        per_pid = self.gpu.clients.per_pid
+        for p in procs:
+            p["gpu"] = per_pid.get(p["pid"], 0.0)
         self.all = procs
+        self.resort()
+
+    def sort_key(self, p):
+        v = p[self.sort]
+        return v.lower() if isinstance(v, str) else v
+
+    def resort(self):
+        self.all.sort(key=self.sort_key, reverse=self.rev)
         self.apply_filter()
 
     def apply_filter(self):
@@ -617,10 +811,131 @@ class App:
         else:
             self.plist = [p for p in self.all if q in p["name"].lower() or q in p["cmd"].lower()
                           or q == str(p["pid"]) or q == p["user"].lower()]
+        self.build_rows()
+
+    @staticmethod
+    def group_name(name):
+        return "Kernel threads" if name.startswith("[") else name.split(" › ")[0]
+
+    def row_ident(self, i):
+        if 0 <= i < len(self.rows):
+            kind, obj, _ = self.rows[i]
+            return (kind, obj["name"] if kind == "g" else obj["pid"])
+        return None
+
+    def build_rows(self):
+        ident = self.row_ident(self.sel) if getattr(self, "rows", None) else None
+        if not self.grouped:
+            rows = [("p", p, 0) for p in self.plist]
+        else:
+            groups = {}
+            for p in self.plist:
+                groups.setdefault(self.group_name(p["name"]), []).append(p)
+            glist = []
+            for name, ps in groups.items():
+                users = {p["user"] for p in ps}
+                glist.append({"name": name, "procs": ps, "count": len(ps),
+                              "pid": min(p["pid"] for p in ps),
+                              "user": ps[0]["user"] if len(users) == 1 else "(multiple)",
+                              "cpu": sum(p["cpu"] for p in ps), "gpu": sum(p["gpu"] for p in ps),
+                              "mem": sum(p["mem"] for p in ps), "memp": sum(p["memp"] for p in ps),
+                              "threads": sum(p["threads"] for p in ps), "state": "",
+                              "cmd": f"{len(ps)} processes"})
+            glist.sort(key=self.sort_key, reverse=self.rev)
+            rows = []
+            for g in glist:
+                if g["count"] == 1:
+                    rows.append(("p", g["procs"][0], 0))
+                    continue
+                rows.append(("g", g, 0))
+                if g["name"] in self.expanded:
+                    rows += [("p", p, 1) for p in g["procs"]]
+        self.rows = rows
+        if ident and not self.follow_top:
+            for i in range(len(rows)):
+                if self.row_ident(i) == ident:
+                    self.sel = i
+                    break
+
+    def selected_target(self):
+        """-> (list of pids, label) for the selected row"""
+        if not self.rows:
+            return [], ""
+        kind, obj, _ = self.rows[max(0, min(self.sel, len(self.rows) - 1))]
+        if kind == "g":
+            return [p["pid"] for p in obj["procs"]], f'{obj["count"]} processes of "{obj["name"]}"'
+        return [obj["pid"]], f'"{obj["name"]}" (PID {obj["pid"]})'
+
+    def set_sort(self, key):
+        if self.sort == key:
+            self.rev = not self.rev
+        else:
+            self.sort, self.rev = key, key not in ("pid", "name", "user")
+        self.resort()
+
+    def toggle_group(self, open_=None):
+        if not self.rows:
+            return
+        kind, obj, depth = self.rows[self.sel]
+        if kind == "p" and depth:  # child row -> act on its group
+            name = self.group_name(obj["name"])
+        elif kind == "g":
+            name = obj["name"]
+        else:
+            return
+        want = (name not in self.expanded) if open_ is None else open_
+        if want:
+            self.expanded.add(name)
+        else:
+            self.expanded.discard(name)
+        self.build_rows()
+        if not want:
+            for i, (k, o, _) in enumerate(self.rows):
+                if k == "g" and o["name"] == name:
+                    self.sel = i
+                    break
+
+    def activate(self):
+        """Enter / double click: expand group or open process details"""
+        if not self.rows:
+            return
+        kind, obj, _ = self.rows[self.sel]
+        if kind == "g":
+            self.toggle_group()
+        else:
+            self.detail = obj["pid"]
+
+    def ask_kill(self, sig):
+        pids, label = self.selected_target() if self.detail is None else \
+            ([self.detail], f"PID {self.detail}")
+        if not pids:
+            return
+        verb = "Terminate" if sig == signal.SIGTERM else "Force kill"
+        self.confirm = {"text": f"{verb} {label}?", "action": lambda: self.kill(pids, sig)}
+
+    def kill(self, pids, sig):
+        ok, denied, gone = 0, 0, 0
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+                ok += 1
+            except PermissionError:
+                denied += 1
+            except ProcessLookupError:
+                gone += 1
+        if denied:
+            self.msg = f" Permission denied for {denied} process(es) – try sudo "
+        elif ok:
+            self.msg = f" Sent {'SIGTERM' if sig == signal.SIGTERM else 'SIGKILL'} to {ok} process(es) "
+        else:
+            self.msg = " Process no longer exists "
+        self.msg_t = time.time()
+        self.detail = None
 
     def draw(self):
         s = self.scr
         s.erase()
+        self.hits = []
         h, w = s.getmaxyx()
         if h < 10 or w < 40:
             self.put(0, 0, f"Window too small ({w}x{h})"[: w], self.col(BRIGHT, attr=curses.A_BOLD))
@@ -681,6 +996,8 @@ class App:
                   ("Usage", f"{g['util']:.0f} %" if g["util"] is not None else "not reported", 117 if g["util"] is not None else DIM),
                   ("VRAM", f"{human(g['mem_used']).strip()} / {human(g['mem_total']).strip()}" if g["mem_total"] else "n/a", 183),
                   ("Temp", f"{g['temp']:.0f} °C" if g["temp"] else "n/a", self.grad(g["temp"]) if g["temp"] else DIM)]
+            if g.get("power") is not None:
+                gi.append(("Power", f"{g['power']:.0f} W", TEXT))
             if len(self.gpus) > 1:
                 gi.append(("More", f"+{len(self.gpus) - 1} GPU(s)", DIM))
             self.gauge_panel(1, gw, gw, gh, "GPU", ACCENT["gpu"], g["util"] or 0, "usage", gi, g["util"] is not None)
@@ -766,6 +1083,9 @@ class App:
 
         self.draw_procs(dy + dh, h, w)
 
+    def hit(self, y, x0, x1, action, overlay=False):
+        self.hits.append((y, x0, x1, action, overlay))
+
     def draw_procs(self, py, h, w):
         s = self.scr
         # ── processes ──
@@ -773,33 +1093,44 @@ class App:
         title = f"Processes ({len(self.plist)})"
         if self.query:
             title = f"Processes ({len(self.plist)}/{len(self.all)}) · filter: {self.query}"
+        if self.grouped:
+            title += " · grouped"
         self.box(py, 0, ph, w, title[: w - 6], ACCENT["proc"],
                  f"sorted by {self.sort} {'▼' if self.rev else '▲'}" if w >= 70 else "")
         if not self.plist and self.query:
             self.put(py + 3, 3, f'No process matches "{self.query}"', self.col(DIM))
         arrow = "▼" if self.rev else "▲"
-        nw = max(12, min(28, (w - 50) // 3))
-        wide = w >= 90
+        nw = max(14, min(30, (w - 56) // 3))
+        wide = w >= 96
         cols = [("pid", "PID", 7)] + ([("user", "USER", 10), ("", "S", 2)] if wide else []) + \
-               [("cpu", "CPU%", 7), ("mem", "MEM", 9)] + ([("", "MEM%", 6), ("", "THR", 5)] if wide else []) + \
+               [("cpu", "CPU%", 7)] + ([("gpu", "GPU%", 6)] if wide else []) + [("mem", "MEM", 9)] + \
+               ([("memp", "MEM%", 6), ("threads", "THR", 5)] if wide else []) + \
                [("name", "NAME", nw), ("", "COMMAND", 0)]
-        hdr = ""
+        self.put(py + 1, 1, " " * (w - 2), self.col(BRIGHT, HEADER_BG, curses.A_BOLD))
+        x = 1
         for k, n, wd in cols:
             n = n + (arrow if k == self.sort else "")
-            hdr += (n.ljust(wd) if k == "name" else n.rjust(wd)) + " " if wd else n
-        self.put(py + 1, 1, hdr.ljust(w - 2), self.col(BRIGHT, HEADER_BG, curses.A_BOLD))
+            txt = (n.ljust(wd) if k == "name" else n.rjust(wd)) if wd else n
+            self.put(py + 1, x, txt, self.col(BRIGHT, HEADER_BG, curses.A_BOLD))
+            if k:
+                self.hit(py + 1, x, x + max(wd, len(n)), lambda k=k: self.set_sort(k))
+            x += (wd or len(n)) + 1
         rows = ph - 3
-        self.sel = max(0, min(self.sel, len(self.plist) - 1))
+        self.page = max(1, rows)
+        self.sel = max(0, min(self.sel, len(self.rows) - 1))
         if self.sel < self.off:
             self.off = self.sel
         if self.sel >= self.off + rows:
             self.off = self.sel - rows + 1
-        for i, p in enumerate(self.plist[self.off: self.off + rows]):
+        self.off = max(0, min(self.off, max(0, len(self.rows) - rows)))
+        for i, (kind, p, depth) in enumerate(self.rows[self.off: self.off + rows]):
             yy = py + 2 + i
-            selected = self.off + i == self.sel
+            idx = self.off + i
+            selected = idx == self.sel
             bg = SEL_BG if selected else (ZEBRA_BG if i % 2 else -1)
             ex = curses.A_BOLD if selected else 0
             self.put(yy, 1, " " * (w - 2), self.col(TEXT, bg))
+            self.hit(yy, 1, w - 2, lambda idx=idx: self.click_row(idx))
             x = 1
 
             def cell(txt, wd, fg, attr=0):
@@ -807,33 +1138,49 @@ class App:
                 self.put(yy, x, txt, self.col(BRIGHT if selected else fg, bg, attr | ex))
                 x += wd + 1
 
-            cell(f"{p['pid']:>7}", 7, 141)
+            grp = kind == "g"
+            cell(f"{'' if grp else p['pid']:>7}", 7, 141)
             if wide:
                 cell(f"{p['user'][:10]:>10}", 10, 203 if p["user"] == "root" else 75)
                 cell(f"{p['state']:>2}", 2, {"R": 82, "S": DIM, "I": 240, "D": 208, "Z": 196}.get(p["state"], DIM))
-            cell(f"{p['cpu']:7.1f}", 7, self.grad(p["cpu"]) if p["cpu"] >= 0.1 else 240,
+            cell(f"{p['cpu']:7.1f}", 7, BRIGHT if p["cpu"] >= 0.1 else 240,
                  curses.A_BOLD if p["cpu"] > 5 else 0)
-            mc = self.grad(p["memp"] * 4) if p["memp"] >= 0.1 else 240
+            if wide:
+                cell(f"{p['gpu']:6.1f}" if p["gpu"] >= 0.05 else f"{'·':>6}", 6,
+                     BRIGHT if p["gpu"] >= 0.1 else 240)
+            mc = BRIGHT if p["memp"] >= 0.1 else 240
             cell(f"{human(p['mem']):>9}", 9, mc)
             if wide:
                 cell(f"{p['memp']:6.1f}", 6, mc)
                 cell(f"{p['threads']:>5}", 5, DIM)
-            nm = p["name"] if len(p["name"]) <= nw else p["name"][: nw - 1] + "…"
+            if grp:
+                nm = f"{'▾' if p['name'] in self.expanded else '▸'} {p['name']} ({p['count']})"
+            elif depth:
+                nm = f"  · {p['name']}"
+            else:
+                nm = p["name"]
+            nm = nm if len(nm) <= nw else nm[: nw - 1] + "…"
             cell(f"{nm:<{nw}}", nw, BRIGHT, curses.A_BOLD)
             room = w - x - 1
             if room > 3:
                 self.put(yy, x, p["cmd"][:room], self.col(BRIGHT if selected else DIM, bg))
 
         # ── footer ──
-        keys = [("q", "Quit"), ("/", "Search"), ("c", "CPU"), ("m", "Mem"), ("p", "PID"), ("n", "Name"), ("r", "Reverse"),
-                ("↑↓", "Select"), ("k", "Kill"), ("K", "Force kill"), ("+/-", "Interval")]
+        keys = [("q", "Quit", ord("q")), ("/", "Search", ord("/")), ("g", "Group", ord("g")),
+                ("Enter", "Details", 10), ("k", "Kill", ord("k")), ("c", "CPU", ord("c")),
+                ("m", "Mem", ord("m")), ("p", "PID", ord("p")), ("n", "Name", ord("n")),
+                ("r", "Reverse", ord("r")), ("+/-", "Interval", ord("+"))]
         if self.new_version:
-            keys.insert(0, ("u", "Update"))
+            keys.insert(0, ("u", "Update", ord("u")))
         self.put(h - 1, 0, " " * w, self.col(TEXT, 236))
         x = 1
-        for k, d in keys:
+        for k, d, code in keys:
+            if x + len(k) + len(d) + 5 > w - 16:
+                break
+            x0 = x
             self.put(h - 1, x, f" {k} ", self.col(16, 81, curses.A_BOLD)); x += len(k) + 2
             self.put(h - 1, x, f" {d}  ", self.col(TEXT, 236)); x += len(d) + 3
+            self.hit(h - 1, x0, x - 2, lambda code=code: self.handle_key(code))
         if self.searching:
             self.put(h - 1, 0, " " * w, self.col(TEXT, 236))
             self.put(h - 1, 1, " / ", self.col(16, 250, curses.A_BOLD))
@@ -847,27 +1194,247 @@ class App:
         else:
             iv = f" v{VERSION} · {self.interval:.1f}s "
             self.put(h - 1, w - len(iv) - 1, iv, self.col(16, 120, curses.A_BOLD))
+
+        if self.detail is not None:
+            self.draw_details(h, w)
+        if self.confirm:
+            self.draw_confirm(h, w)
         s.refresh()
 
-    def kill(self, sig):
-        if not self.plist:
-            return
-        p = self.plist[self.sel]
+    # ── overlays ──
+    def panel(self, h, w, ph, pw, title):
+        y, x = max(0, (h - ph) // 2), max(0, (w - pw) // 2)
+        for i in range(ph):
+            self.put(y + i, x, " " * pw, self.col(TEXT, 234))
+        a = self.col(BRIGHT, 234)
+        self.put(y, x, "╭" + "─" * (pw - 2) + "╮", a)
+        for i in range(1, ph - 1):
+            self.put(y + i, x, "│", a)
+            self.put(y + i, x + pw - 1, "│", a)
+        self.put(y + ph - 1, x, "╰" + "─" * (pw - 2) + "╯", a)
+        self.put(y, x + 2, f" {title} "[: pw - 4], self.col(BRIGHT, 234, curses.A_BOLD))
+        return y, x
+
+    def button(self, y, x, label, action, primary=False):
+        self.put(y, x, f" {label} ", self.col(16 if primary else BRIGHT, 250 if primary else 240, curses.A_BOLD))
+        self.hit(y, x, x + len(label) + 1, action, overlay=True)
+        return x + len(label) + 3
+
+    def draw_confirm(self, h, w):
+        text = self.confirm["text"]
+        pw = min(w - 2, max(44, len(text) + 6))
+        y, x = self.panel(h, w, 7, pw, "Confirm")
+        self.put(y + 2, x + 3, text[: pw - 6], self.col(BRIGHT, 234, curses.A_BOLD))
+        bx = x + pw - 28
+        bx = self.button(y + 4, bx, "Yes (y)", lambda: self.handle_key(ord("y")), primary=True)
+        self.button(y + 4, bx, "No (n)", lambda: self.handle_key(ord("n")))
+
+    def proc_details(self, pid):
+        base = f"/proc/{pid}"
+        stat = read(base + "/stat")
+        if not stat:
+            return None
+        f = stat[stat.rindex(")") + 2:].split()
+        status = {}
+        for line in read(base + "/status").splitlines():
+            k, _, v = line.partition(":")
+            status[k] = v.strip()
+        btime = 0
+        for line in read("/proc/stat").splitlines():
+            if line.startswith("btime"):
+                btime = int(line.split()[1])
+        started = btime + int(f[19]) / CLK_TCK
+        run = max(0, time.time() - started)
+
+        def link(p):
+            try:
+                return os.readlink(p)
+            except OSError:
+                return "(no access)"
+
+        io = {}
+        for line in read(base + "/io").splitlines():
+            k, _, v = line.partition(":")
+            io[k] = int(v.strip() or 0)
+        unit = ""
+        for line in read(base + "/cgroup").splitlines():
+            for part in line.split("/")[::-1]:
+                if part.endswith((".service", ".scope")):
+                    unit = part
+                    break
+            if unit:
+                break
         try:
-            os.kill(p["pid"], sig)
-            self.msg = f" Signal {int(sig)} → {p['pid']} {p['name']} "
-        except PermissionError:
-            self.msg = " Permission denied (try sudo) "
-        except ProcessLookupError:
-            self.msg = " Process no longer exists "
-        self.msg_t = time.time()
+            nfd = str(len(os.listdir(base + "/fd")))
+        except OSError:
+            nfd = "(no access)"
+        ppid = int(f[1])
+        pname = read(f"/proc/{ppid}/comm").strip() if ppid else ""
+        p = next((x for x in self.all if x["pid"] == pid), None)
+        d, hh, mm = int(run // 86400), int(run % 86400 // 3600), int(run % 3600 // 60)
+        rows = [
+            ("Name", p["name"] if p else read(base + "/comm").strip()),
+            ("PID", f"{pid}    parent: {ppid} {('(' + pname + ')') if pname else ''}"),
+            ("User", f"{p['user'] if p else '?'}    state: {status.get('State', '?')}"),
+            ("CPU / GPU", f"{p['cpu']:.1f} %  /  {p['gpu']:.1f} %" if p else "?"),
+            ("Memory", f"RSS {human(int(status.get('VmRSS', '0 kB').split()[0]) * 1024).strip()}"
+                       f"   swap {human(int(status.get('VmSwap', '0 kB').split()[0]) * 1024).strip()}"),
+            ("Threads", f"{status.get('Threads', '?')}    priority (nice): {f[16]}    open files: {nfd}"),
+            ("Started", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+             + f"   (running {d}d {hh:02d}:{mm:02d})"),
+            ("Disk I/O", f"read {human(io['read_bytes']).strip()}   written {human(io['write_bytes']).strip()}"
+             if io else "(no access – try sudo)"),
+            ("Service", unit or "–"),
+            ("Program", link(base + "/exe")),
+            ("Work dir", link(base + "/cwd")),
+            ("Command", p["cmd"] if p else read(base + "/cmdline").replace("\0", " ")),
+        ]
+        return rows
+
+    def draw_details(self, h, w):
+        rows = self.proc_details(self.detail)
+        if rows is None:
+            self.detail = None
+            self.msg, self.msg_t = " Process has exited ", time.time()
+            return
+        pw = min(w - 2, 100)
+        vw = pw - 17
+        lines = []
+        for k, v in rows:
+            v = str(v) or "–"
+            chunks = [v[i: i + vw] for i in range(0, len(v), vw)] or [""]
+            if k == "Command":
+                chunks = chunks[: max(1, h - 20)]
+            else:
+                chunks = chunks[:1]
+            for j, c in enumerate(chunks):
+                lines.append((k if j == 0 else "", c))
+        ph = min(h - 1, len(lines) + 5)
+        y, x = self.panel(h, w, ph, pw, "Process details")
+        for i, (k, v) in enumerate(lines[: ph - 5]):
+            self.put(y + 2 + i, x + 3, f"{k:<12}", self.col(DIM, 234, curses.A_BOLD))
+            self.put(y + 2 + i, x + 16, v, self.col(BRIGHT, 234))
+        by = y + ph - 2
+        bx = x + 3
+        bx = self.button(by, bx, "Terminate (k)", lambda: self.handle_key(ord("k")))
+        bx = self.button(by, bx, "Force kill (K)", lambda: self.handle_key(ord("K")))
+        self.button(by, bx, "Close (Esc)", lambda: self.handle_key(27), primary=True)
+
+    # ── input ──
+    def click_row(self, idx):
+        now = time.time()
+        double = idx == self.last_click[0] and now - self.last_click[1] < 0.4
+        self.sel = idx
+        self.follow_top = False
+        self.last_click = (idx, 0 if double else now)
+        if double:
+            self.activate()
+
+    def on_mouse(self):
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        up = bstate & curses.BUTTON4_PRESSED
+        down = bstate & getattr(curses, "BUTTON5_PRESSED", 0x200000)
+        if (up or down) and self.detail is None and not self.confirm:
+            self.sel += -3 if up else 3
+            self.follow_top = False
+            return
+        if not bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            return
+        overlay = self.detail is not None or self.confirm
+        for y, x0, x1, action, ov in reversed(self.hits):
+            if overlay and not ov:
+                continue
+            if y == my and x0 <= mx <= x1:
+                action()
+                return
+
+    def handle_key(self, k):
+        """Returns "quit" to exit the main loop."""
+        if k == curses.KEY_MOUSE:
+            self.on_mouse()
+            return None
+        if self.confirm:
+            if k in (ord("y"), ord("Y"), 10, 13, curses.KEY_ENTER):
+                action, self.confirm = self.confirm["action"], None
+                action()
+            elif k in (ord("n"), ord("N"), 27, ord("q")):
+                self.confirm = None
+            return None
+        if self.detail is not None:
+            if k in (27, 10, 13, curses.KEY_ENTER, ord("q"), curses.KEY_LEFT, curses.KEY_BACKSPACE):
+                self.detail = None
+            elif k == ord("k"):
+                self.ask_kill(signal.SIGTERM)
+            elif k == ord("K"):
+                self.ask_kill(signal.SIGKILL)
+            return None
+        if self.searching:
+            if k in (10, 13, curses.KEY_ENTER):
+                self.searching = False
+            elif k == 27:
+                self.searching, self.query = False, ""
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                self.query = self.query[:-1]
+            elif k == curses.KEY_UP:
+                self.sel -= 1
+            elif k == curses.KEY_DOWN:
+                self.sel += 1
+            elif 32 <= k < 127:
+                self.query += chr(k)
+            if k not in (curses.KEY_UP, curses.KEY_DOWN):
+                self.sel = self.off = 0
+            self.apply_filter()
+            return None
+        keymap = {ord("c"): "cpu", ord("m"): "mem", ord("p"): "pid", ord("n"): "name"}
+        if k == 27 and self.query:  # Esc clears an active filter first
+            self.query = ""
+            self.apply_filter()
+        elif k in (ord("q"), ord("Q"), 27):
+            return "quit"
+        elif k == ord("/"):
+            self.searching = True
+        elif k in keymap:
+            self.sort, self.rev = keymap[k], keymap[k] not in ("pid", "name")
+            self.resort()
+        elif k == ord("r"):
+            self.rev = not self.rev
+            self.resort()
+        elif k == ord("g"):
+            self.grouped = not self.grouped
+            self.sel = self.off = 0
+            self.build_rows()
+        elif k in (10, 13, curses.KEY_ENTER):
+            self.activate()
+        elif k in (curses.KEY_RIGHT, ord(" ")):
+            self.toggle_group(True if k == curses.KEY_RIGHT else None)
+        elif k == curses.KEY_LEFT:
+            self.toggle_group(False)
+        elif k in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -self.page,
+                    curses.KEY_NPAGE: self.page, curses.KEY_HOME: -10 ** 9, curses.KEY_END: 10 ** 9}[k]
+            self.sel = max(0, min(len(self.rows) - 1, self.sel + step))
+            self.follow_top = False
+        elif k == ord("k"):
+            self.ask_kill(signal.SIGTERM)
+        elif k == ord("K"):
+            self.ask_kill(signal.SIGKILL)
+        elif k == ord("+"):
+            self.interval = min(10, self.interval + 0.5)
+        elif k == ord("-"):
+            self.interval = max(0.5, self.interval - 0.5)
+        elif k in (ord("u"), ord("U")):
+            self.install_update()
+            if self.restart:
+                return "quit"
+        return None
 
     def run(self):
         time.sleep(0.2)
         self.update()
         last = time.time()
-        keymap = {ord("c"): ("cpu", True), ord("m"): ("mem", True),
-                  ord("p"): ("pid", False), ord("n"): ("name", False)}
         while True:
             self.draw()
             while True:
@@ -877,45 +1444,8 @@ class App:
                         break
                     time.sleep(0.03)
                     continue
-                if self.searching:
-                    if k in (10, 13, curses.KEY_ENTER):
-                        self.searching = False
-                    elif k == 27:
-                        self.searching, self.query = False, ""
-                    elif k in (curses.KEY_BACKSPACE, 127, 8):
-                        self.query = self.query[:-1]
-                    elif k == curses.KEY_UP: self.sel -= 1
-                    elif k == curses.KEY_DOWN: self.sel += 1
-                    elif 32 <= k < 127:
-                        self.query += chr(k)
-                    if k not in (curses.KEY_UP, curses.KEY_DOWN):
-                        self.sel = self.off = 0
-                    self.apply_filter()
-                    self.draw()
-                    continue
-                if k == 27 and self.query:  # Esc clears an active filter first
-                    self.query = ""
-                    self.apply_filter()
-                elif k in (ord("q"), ord("Q"), 27):
+                if self.handle_key(k) == "quit":
                     return
-                elif k == ord("/"):
-                    self.searching = True
-                elif k in keymap:
-                    self.sort, self.rev = keymap[k]
-                elif k == ord("r"): self.rev = not self.rev
-                elif k == curses.KEY_UP: self.sel -= 1
-                elif k == curses.KEY_DOWN: self.sel += 1
-                elif k == curses.KEY_PPAGE: self.sel -= 15
-                elif k == curses.KEY_NPAGE: self.sel += 15
-                elif k == curses.KEY_HOME: self.sel = 0
-                elif k == ord("k"): self.kill(signal.SIGTERM)
-                elif k == ord("K"): self.kill(signal.SIGKILL)
-                elif k == ord("+"): self.interval = min(10, self.interval + 0.5)
-                elif k == ord("-"): self.interval = max(0.5, self.interval - 0.5)
-                elif k in (ord("u"), ord("U")):
-                    self.install_update()
-                    if self.restart:
-                        return
                 self.draw()
             self.update()
             last = time.time()
