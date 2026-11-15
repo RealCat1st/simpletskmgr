@@ -11,6 +11,7 @@ Keys:
   ↑ ↓      Select process      PgUp/PgDn  page
   k        Terminate selected process (SIGTERM),  K = SIGKILL
   + / -    Change refresh interval
+  /        Search processes (Enter = keep filter, Esc = clear)
   u        Install available update
 
 Set STM_NO_UPDATE_CHECK=1 to disable the update check on start.
@@ -28,7 +29,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO = "RealCat1st/simpletskmgr"
 RAW_URL = f"https://raw.githubusercontent.com/{REPO}/main/simpletskmgr.py"
 
@@ -405,7 +406,8 @@ class App:
         self.sel, self.off = 0, 0
         self.interval = 1.0
         self.msg, self.msg_t = "", 0
-        self.plist, self.history = [], []
+        self.plist, self.history, self.all = [], [], []
+        self.query, self.searching = "", False
         self.new_version = None
         self.restart = False
         if not os.environ.get("STM_NO_UPDATE_CHECK"):
@@ -593,7 +595,16 @@ class App:
         procs = self.procs.update(self.cpu.total_jiffies, len(self.cpu.usage) - 1, self.mem["total"])
         key = self.sort
         procs.sort(key=lambda p: (p[key].lower() if key == "name" else p[key]), reverse=self.rev)
-        self.plist = procs
+        self.all = procs
+        self.apply_filter()
+
+    def apply_filter(self):
+        q = self.query.lower().strip()
+        if not q:
+            self.plist = self.all
+        else:
+            self.plist = [p for p in self.all if q in p["name"].lower() or q in p["cmd"].lower()
+                          or q == str(p["pid"]) or q == p["user"].lower()]
 
     def draw(self):
         s = self.scr
@@ -639,7 +650,7 @@ class App:
                     ("Clock", f"{fr:.0f} MHz" if fr else "n/a", 117),
                     ("Temp", f"{tp:.0f} °C" if tp else "n/a", self.grad(tp) if tp else DIM),
                     ("Load", load, 223),
-                    ("Procs", str(len(self.plist)), 183)]
+                    ("Procs", str(len(self.all)), 183)]
         rp = m["used"] / m["total"] * 100
         g = self.gpus[0] if self.gpus else None
         if compact:  # small window: three plain bars instead of ring gauges
@@ -683,7 +694,6 @@ class App:
         sh = min(rows_needed, max(3, (h - y0 - 12) // 2)) + 2
         crow = sh - 2
         self.box(y0, 0, sh, half, "CPU cores", ACCENT["cores"])
-        self.spark(y0, half - 3 - min(30, half - 20), self.history, min(30, half - 20))
         cw = (half - 4) // ncols
         for i, u in enumerate(cores):
             r_, c_ = i % crow, i // crow
@@ -748,8 +758,13 @@ class App:
         s = self.scr
         # ── processes ──
         ph = h - py - 1
-        self.box(py, 0, ph, w, f"Processes ({len(self.plist)})", ACCENT["proc"],
-                 f"sorted by {self.sort} {'▼' if self.rev else '▲'}")
+        title = f"Processes ({len(self.plist)})"
+        if self.query:
+            title = f"Processes ({len(self.plist)}/{len(self.all)}) · filter: {self.query}"
+        self.box(py, 0, ph, w, title[: w - 6], ACCENT["proc"],
+                 f"sorted by {self.sort} {'▼' if self.rev else '▲'}" if w >= 70 else "")
+        if not self.plist and self.query:
+            self.put(py + 3, 3, f'No process matches "{self.query}"', self.col(DIM))
         arrow = "▼" if self.rev else "▲"
         nw = max(12, min(28, (w - 50) // 3))
         wide = w >= 90
@@ -798,7 +813,7 @@ class App:
                 self.put(yy, x, p["cmd"][:room], self.col(BRIGHT if selected else DIM, bg))
 
         # ── footer ──
-        keys = [("q", "Quit"), ("c", "CPU"), ("m", "Mem"), ("p", "PID"), ("n", "Name"), ("r", "Reverse"),
+        keys = [("q", "Quit"), ("/", "Search"), ("c", "CPU"), ("m", "Mem"), ("p", "PID"), ("n", "Name"), ("r", "Reverse"),
                 ("↑↓", "Select"), ("k", "Kill"), ("K", "Force kill"), ("+/-", "Interval")]
         if self.new_version:
             keys.insert(0, ("u", "Update"))
@@ -807,7 +822,15 @@ class App:
         for k, d in keys:
             self.put(h - 1, x, f" {k} ", self.col(16, 81, curses.A_BOLD)); x += len(k) + 2
             self.put(h - 1, x, f" {d}  ", self.col(TEXT, 236)); x += len(d) + 3
-        if self.msg and time.time() - self.msg_t < 3:
+        if self.searching:
+            self.put(h - 1, 0, " " * w, self.col(TEXT, 236))
+            self.put(h - 1, 1, " / ", self.col(16, 250, curses.A_BOLD))
+            self.put(h - 1, 5, f"Search: {self.query}", self.col(BRIGHT, 236, curses.A_BOLD))
+            self.put(h - 1, 13 + len(self.query), "█", self.col(BRIGHT, 236))
+            hint = " Enter keep · Esc clear "
+            if w > len(self.query) + 40:
+                self.put(h - 1, w - len(hint) - 1, hint, self.col(DIM, 236))
+        elif self.msg and time.time() - self.msg_t < 3:
             self.put(h - 1, max(0, w - len(self.msg) - 1), self.msg, self.col(BRIGHT, 161, curses.A_BOLD))
         else:
             iv = f" v{VERSION} · {self.interval:.1f}s "
@@ -842,9 +865,30 @@ class App:
                         break
                     time.sleep(0.03)
                     continue
-                if k in (ord("q"), ord("Q"), 27):
+                if self.searching:
+                    if k in (10, 13, curses.KEY_ENTER):
+                        self.searching = False
+                    elif k == 27:
+                        self.searching, self.query = False, ""
+                    elif k in (curses.KEY_BACKSPACE, 127, 8):
+                        self.query = self.query[:-1]
+                    elif k == curses.KEY_UP: self.sel -= 1
+                    elif k == curses.KEY_DOWN: self.sel += 1
+                    elif 32 <= k < 127:
+                        self.query += chr(k)
+                    if k not in (curses.KEY_UP, curses.KEY_DOWN):
+                        self.sel = self.off = 0
+                    self.apply_filter()
+                    self.draw()
+                    continue
+                if k == 27 and self.query:  # Esc clears an active filter first
+                    self.query = ""
+                    self.apply_filter()
+                elif k in (ord("q"), ord("Q"), 27):
                     return
-                if k in keymap:
+                elif k == ord("/"):
+                    self.searching = True
+                elif k in keymap:
                     self.sort, self.rev = keymap[k]
                 elif k == ord("r"): self.rev = not self.rev
                 elif k == curses.KEY_UP: self.sel -= 1

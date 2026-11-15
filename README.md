@@ -12,6 +12,7 @@ colored ring gauges for **CPU**, **GPU** and **memory**.
 - Swap, VRAM, network and disk I/O throughput
 - Disk usage for all mounted filesystems
 - Process list with readable app names (Flatpak apps, Wine, Python/Node/Java scripts) — sort by CPU, memory, PID or name, terminate or kill processes
+- Live process search
 - Built-in update check
 - **Zero dependencies**: a single Python file that reads `/proc` and `/sys` directly
 
@@ -60,6 +61,7 @@ Run with `sudo` to be able to kill processes of other users.
 
 | Key | Action |
 |---|---|
+| `/` | Search processes by name, command, PID or user (`Enter` keep filter, `Esc` clear) |
 | `c` / `m` / `p` / `n` | Sort by CPU / memory / PID / name |
 | `r` | Reverse sort order |
 | `↑` `↓` `PgUp` `PgDn` `Home` | Select process |
