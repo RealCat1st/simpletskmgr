@@ -11,7 +11,8 @@ colored ring gauges for **CPU**, **GPU** and **memory**.
 - NPU: Intel NPU (`intel_vpu`) usage, AMD XDNA detected
 - Swap, VRAM, network and disk I/O throughput
 - Disk usage for all mounted filesystems
-- Process list sortable by CPU, memory, PID or name — terminate or kill processes
+- Process list with readable app names (Flatpak apps, Wine, Python/Node/Java scripts) — sort by CPU, memory, PID or name, terminate or kill processes
+- Built-in update check
 - **Zero dependencies**: a single Python file that reads `/proc` and `/sys` directly
 
 Works on Arch, Debian, Ubuntu, Fedora, openSUSE and any other Linux distro with Python 3.8+.
@@ -65,9 +66,16 @@ Run with `sudo` to be able to kill processes of other users.
 | `k` | Terminate selected process (SIGTERM) |
 | `K` | Force kill selected process (SIGKILL) |
 | `+` / `-` | Slower / faster refresh |
+| `u` | Install update (shown when a new version is available) |
 | `q` | Quit |
 
-Requires a terminal of at least 80×24 with 256-color support (virtually all modern terminals).
+### Updates
+
+On every start SimpleTskMgr checks GitHub for a newer version (in the background, it never slows down startup).
+If one is available, the title bar shows it — press `u` to update and restart.
+Set `STM_NO_UPDATE_CHECK=1` to disable the check.
+
+The layout adapts to the window size (minimum 40×10). Best experience at 100×34 or larger with 256-color support (virtually all modern terminals).
 
 ## License
 

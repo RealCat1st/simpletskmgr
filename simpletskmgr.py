@@ -11,15 +11,26 @@ Keys:
   ↑ ↓      Select process      PgUp/PgDn  page
   k        Terminate selected process (SIGTERM),  K = SIGKILL
   + / -    Change refresh interval
+  u        Install available update
+
+Set STM_NO_UPDATE_CHECK=1 to disable the update check on start.
 """
 import curses
 import glob
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
+import threading
 import time
+import urllib.request
+
+VERSION = "1.1.0"
+REPO = "RealCat1st/simpletskmgr"
+RAW_URL = f"https://raw.githubusercontent.com/{REPO}/main/simpletskmgr.py"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -244,8 +255,72 @@ class Net:
         self.prev, self.prev_t = cur, now
 
 
+INTERPRETERS = re.compile(
+    r"^(python[\d.]*|pypy[\d.]*|node|nodejs|deno|bun|java|perl[\d.]*|ruby[\d.]*|php[\d.]*|"
+    r"lua[\d.]*|luajit|sh|bash|dash|zsh|fish|ksh|mono|dotnet|electron\d*|gjs|wine(64)?(-preloader)?|"
+    r"box64|box86|qemu-[\w-]+|ld-linux[\w.-]*\.so[\d.]*)$")
+VALUE_OPTS = {"-m", "-c", "-cp", "-classpath", "-jar", "--rcfile", "--init-file"}
+
+
+def pretty_app_id(app_id):
+    """org.vinegarhq.Sober -> Sober, com.discordapp.Discord -> Discord"""
+    parts = [x for x in app_id.split(".") if x]
+    if not parts:
+        return app_id
+    last = parts[-1]
+    if last.lower() in ("desktop", "app", "client", "stable", "beta") and len(parts) > 1:
+        last = parts[-2]
+    return last[:1].upper() + last[1:]
+
+
+def basename_any(path):
+    """basename that also understands Windows paths (wine)"""
+    return re.split(r"[\\/]", path.rstrip("/\\"))[-1] or path
+
+
+def friendly_name(pid, comm, argv):
+    if not argv:
+        return f"[{comm}]"  # kernel thread
+    a0 = argv[0]
+    if " " in a0 and len(argv) == 1:  # process rewrote its title, e.g. "sshd-session: user@pts/0"
+        a0 = a0.split()[0].rstrip(":")
+    base = basename_any(a0)
+    m = INTERPRETERS.match(base)
+    if m and len(argv) > 1:
+        skip = False
+        for arg in argv[1:]:
+            if skip:
+                if base.startswith("python") and arg and not arg.startswith("-"):
+                    return f"{base} -m {arg}"
+                skip = False
+                continue
+            if arg in VALUE_OPTS:
+                skip = arg not in ("-jar",)
+                continue
+            if arg.startswith("-"):
+                continue
+            cand = basename_any(arg)
+            if cand:
+                base = re.sub(r"\.(py|js|mjs|cjs|pl|rb|php|lua|sh|jar)$", "", cand)
+            break
+    if base == comm[:15] or not base:
+        base = base or comm
+    app = None
+    info = read(f"/proc/{pid}/root/.flatpak-info")
+    if info:
+        for line in info.splitlines():
+            if line.startswith("name="):
+                app = pretty_app_id(line[5:].strip())
+                break
+    if app and app.lower() not in base.lower():
+        return f"{app} › {base}"
+    return app if app and app.lower() == base.lower() else base
+
+
 class Procs:
     def __init__(self):
+        self.names = {}
+        self.home = os.path.expanduser("~")
         self.prev = {}
         self.prev_total = None
         self.users = {}
@@ -267,6 +342,7 @@ class Procs:
                 name = stat[stat.index("(") + 1: stat.rindex(")")]
                 f = stat[stat.rindex(")") + 2:].split()
                 state, utime, stime, threads, rss = f[0], int(f[11]), int(f[12]), int(f[17]), int(f[21]) * PAGE
+                start = f[19]
                 uid = os.stat(f"/proc/{pid}").st_uid
             except Exception:
                 continue
@@ -276,11 +352,20 @@ class Procs:
             if dt and pid in self.prev:
                 # share of total CPU × cores -> like "top" (100% = 1 core)
                 cpu = (t - self.prev[pid]) / dt * 100 * ncpu
-            cmd = read(f"/proc/{pid}/cmdline").replace("\0", " ").strip() or f"[{name}]"
-            procs.append({"pid": int(pid), "name": name, "user": self.users.get(uid, str(uid)),
+            raw = read(f"/proc/{pid}/cmdline")
+            argv = [a for a in raw.split("\0") if a] if raw else []
+            key = (pid, start)
+            if key not in self.names:
+                self.names[key] = friendly_name(pid, name, argv)
+            cmd = " ".join(argv) or f"[{name}]"
+            if self.home != "/":
+                cmd = cmd.replace(self.home, "~")
+            procs.append({"pid": int(pid), "name": self.names[key], "user": self.users.get(uid, str(uid)),
                           "state": state, "cpu": cpu, "mem": rss, "memp": rss / memtotal * 100,
                           "threads": threads, "cmd": cmd})
         self.prev, self.prev_total = cur, total_jiffies
+        alive = {(p, cur_start) for (p, cur_start) in self.names if p in cur}
+        self.names = {k: v for k, v in self.names.items() if k in alive}
         return procs
 
 
@@ -321,6 +406,10 @@ class App:
         self.interval = 1.0
         self.msg, self.msg_t = "", 0
         self.plist, self.history = [], []
+        self.new_version = None
+        self.restart = False
+        if not os.environ.get("STM_NO_UPDATE_CHECK"):
+            threading.Thread(target=self.check_update, daemon=True).start()
         self.distro = "Linux"
         for line in read("/etc/os-release").splitlines():
             if line.startswith("PRETTY_NAME="):
@@ -333,6 +422,45 @@ class App:
         scr.nodelay(True)
         scr.idlok(False)  # no line-scroll optimisation -> no ghost lines
         scr.keypad(True)
+
+    # ── updates ──
+    @staticmethod
+    def _vt(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+    def check_update(self):
+        try:
+            with urllib.request.urlopen(RAW_URL, timeout=4) as r:
+                head = r.read(4096).decode("utf-8", "replace")
+            m = re.search(r'^VERSION = "([^"]+)"', head, re.M)
+            if m and self._vt(m.group(1)) > self._vt(VERSION):
+                self.new_version = m.group(1)
+        except Exception:
+            pass  # offline etc. – just skip
+
+    def install_update(self):
+        if not self.new_version:
+            self.msg, self.msg_t = " You are on the latest version ", time.time()
+            return
+        path = os.path.realpath(__file__)
+        if not os.access(path, os.W_OK) or not os.access(os.path.dirname(path), os.W_OK):
+            self.msg, self.msg_t = " No write access – rerun the installer with sudo ", time.time()
+            return
+        self.msg, self.msg_t = " Downloading update... ", time.time()
+        self.draw()
+        try:
+            with urllib.request.urlopen(RAW_URL, timeout=15) as r:
+                code = r.read()
+            compile(code, "simpletskmgr.py", "exec")  # sanity check
+            tmp = path + ".new"
+            with open(tmp, "wb") as f:
+                f.write(code)
+            os.chmod(tmp, os.stat(path).st_mode)
+            os.replace(tmp, path)
+        except Exception as e:
+            self.msg, self.msg_t = f" Update failed: {e} "[:60], time.time()
+            return
+        self.restart = True
 
     # ── colour helpers ──
     def _map(self, c):
@@ -471,9 +599,9 @@ class App:
         s = self.scr
         s.erase()
         h, w = s.getmaxyx()
-        if h < 24 or w < 80:
-            self.put(0, 0, f"Terminal too small ({w}x{h}) – need at least 80x24",
-                     self.col(196, attr=curses.A_BOLD))
+        if h < 10 or w < 40:
+            self.put(0, 0, f"Window too small ({w}x{h})"[: w], self.col(BRIGHT, attr=curses.A_BOLD))
+            self.put(1, 0, "Please enlarge it (min 40x10)"[: w], self.col(DIM))
             s.refresh()
             return
         m = self.mem
@@ -494,10 +622,15 @@ class App:
             if i:
                 self.put(0, x, " │ ", self.col(140, TITLE_BG)); x += 3
             self.put(0, x, t, a); x += len(t)
-        self.put(0, w - 10, time.strftime(" %H:%M:%S "), tb)
+        clock = time.strftime(" %H:%M:%S ")
+        self.put(0, w - len(clock), clock, tb)
+        if self.new_version:
+            up_txt = f" ↑ v{self.new_version} available – press u "
+            self.put(0, max(0, w - len(clock) - len(up_txt) - 1), up_txt, self.col(16, 250, curses.A_BOLD))
 
         # ── gauge row: CPU / GPU / RAM ──
-        gh = 11 if h >= 42 else 9 if h >= 34 else 7
+        compact = h < 20 or w < 60
+        gh = 11 if h >= 42 else 9 if h >= 34 else 7 if h >= 26 else 5
         gw = w // 3
         fr, tp = self.cpu.freq(), self.cpu.temp()
         ncores = len(self.cpu.usage) - 1
@@ -507,9 +640,19 @@ class App:
                     ("Temp", f"{tp:.0f} °C" if tp else "n/a", self.grad(tp) if tp else DIM),
                     ("Load", load, 223),
                     ("Procs", str(len(self.plist)), 183)]
+        rp = m["used"] / m["total"] * 100
+        g = self.gpus[0] if self.gpus else None
+        if compact:  # small window: three plain bars instead of ring gauges
+            self.bar(1, 1, w - 2, self.cpu.usage[0], "CPU")
+            if g and g["util"] is not None:
+                self.bar(2, 1, w - 2, g["util"], "GPU")
+            else:
+                self.put(2, 1, "GPU   n/a", self.col(DIM))
+            self.bar(3, 1, w - 2, rp, "RAM", f"{human(m['used']).strip()}/{human(m['total']).strip()}")
+            py = 4
+            return self.draw_procs(py, h, w)
         self.gauge_panel(1, 0, gw, gh, "CPU", ACCENT["cpu"], self.cpu.usage[0], "usage", cpu_info)
 
-        g = self.gpus[0] if self.gpus else None
         if g:
             gi = [("Name", g["name"], TEXT),
                   ("Usage", f"{g['util']:.0f} %" if g["util"] is not None else "not reported", 117 if g["util"] is not None else DIM),
@@ -521,7 +664,6 @@ class App:
         else:
             self.gauge_panel(1, gw, gw, gh, "GPU", ACCENT["gpu"], 0, "usage", [("Name", "no GPU found", DIM)], False)
 
-        rp = m["used"] / m["total"] * 100
         ram_info = [("Used", human(m["used"]).strip(), self.grad(rp)),
                     ("Free", human(m["total"] - m["used"]).strip(), 120),
                     ("Total", human(m["total"]).strip(), TEXT),
@@ -529,8 +671,10 @@ class App:
                     ("Swap", f"{human(m['swap_used']).strip()} / {human(m['swap_total']).strip()}" if m["swap_total"] else "none", 183)]
         self.gauge_panel(1, 2 * gw, w - 2 * gw, gh, "Memory", ACCENT["ram"], rp, "used", ram_info)
 
-        # ── cores + system row ──
+        # ── cores + system row (only if there is room) ──
         y0 = 1 + gh
+        if h < 34:  # not enough room for cores/system/disks -> more process rows
+            return self.draw_procs(y0, h, w)
         half = w // 2
         cores = self.cpu.usage[1:]
         ncols = 2 if half > 70 else 1
@@ -590,24 +734,32 @@ class App:
 
         # ── disks ──
         dy = y0 + sh
-        dh = min(len(self.mounts), 4) + 2
+        dh = min(len(self.mounts), 4, max(1, (h - dy - 9) // 2)) + 2
+        if h - dy - dh < 12:
+            return self.draw_procs(dy, h, w)
         self.box(dy, 0, dh, w, "Disks", ACCENT["disk"], f"{len(self.mounts)} mounted")
         for i, (mnt, tot, used, fs) in enumerate(self.mounts[: dh - 2]):
             self.bar(dy + 1 + i, 2, w - 4, used / tot * 100, mnt[-6:],
                      f"{human(used).strip()}/{human(tot).strip()}  {fs:<5} {mnt}", ACCENT["disk"])
 
+        self.draw_procs(dy + dh, h, w)
+
+    def draw_procs(self, py, h, w):
+        s = self.scr
         # ── processes ──
-        py = dy + dh
         ph = h - py - 1
         self.box(py, 0, ph, w, f"Processes ({len(self.plist)})", ACCENT["proc"],
                  f"sorted by {self.sort} {'▼' if self.rev else '▲'}")
         arrow = "▼" if self.rev else "▲"
-        cols = [("pid", "PID", 7), ("user", "USER", 10), ("", "S", 2), ("cpu", "CPU%", 7),
-                ("mem", "MEM", 9), ("", "MEM%", 6), ("", "THR", 5), ("name", "COMMAND", 0)]
+        nw = max(12, min(28, (w - 50) // 3))
+        wide = w >= 90
+        cols = [("pid", "PID", 7)] + ([("user", "USER", 10), ("", "S", 2)] if wide else []) + \
+               [("cpu", "CPU%", 7), ("mem", "MEM", 9)] + ([("", "MEM%", 6), ("", "THR", 5)] if wide else []) + \
+               [("name", "NAME", nw), ("", "COMMAND", 0)]
         hdr = ""
         for k, n, wd in cols:
             n = n + (arrow if k == self.sort else "")
-            hdr += n.rjust(wd) + " " if wd else n
+            hdr += (n.ljust(wd) if k == "name" else n.rjust(wd)) + " " if wd else n
         self.put(py + 1, 1, hdr.ljust(w - 2), self.col(BRIGHT, HEADER_BG, curses.A_BOLD))
         rows = ph - 3
         self.sel = max(0, min(self.sel, len(self.plist) - 1))
@@ -629,25 +781,27 @@ class App:
                 x += wd + 1
 
             cell(f"{p['pid']:>7}", 7, 141)
-            cell(f"{p['user'][:10]:>10}", 10, 203 if p["user"] == "root" else 75)
-            cell(f"{p['state']:>2}", 2, {"R": 82, "S": DIM, "I": 240, "D": 208, "Z": 196}.get(p["state"], DIM))
+            if wide:
+                cell(f"{p['user'][:10]:>10}", 10, 203 if p["user"] == "root" else 75)
+                cell(f"{p['state']:>2}", 2, {"R": 82, "S": DIM, "I": 240, "D": 208, "Z": 196}.get(p["state"], DIM))
             cell(f"{p['cpu']:7.1f}", 7, self.grad(p["cpu"]) if p["cpu"] >= 0.1 else 240,
                  curses.A_BOLD if p["cpu"] > 5 else 0)
             mc = self.grad(p["memp"] * 4) if p["memp"] >= 0.1 else 240
             cell(f"{human(p['mem']):>9}", 9, mc)
-            cell(f"{p['memp']:6.1f}", 6, mc)
-            cell(f"{p['threads']:>5}", 5, DIM)
+            if wide:
+                cell(f"{p['memp']:6.1f}", 6, mc)
+                cell(f"{p['threads']:>5}", 5, DIM)
+            nm = p["name"] if len(p["name"]) <= nw else p["name"][: nw - 1] + "…"
+            cell(f"{nm:<{nw}}", nw, BRIGHT, curses.A_BOLD)
             room = w - x - 1
-            cmd = p["cmd"]
-            first, _, rest = cmd.partition(" ")
-            self.put(yy, x, first[:room], self.col(BRIGHT if selected else 229, bg, curses.A_BOLD))
-            if rest and len(first) + 1 < room:
-                self.put(yy, x + len(first) + 1, rest[: room - len(first) - 1],
-                         self.col(BRIGHT if selected else 248, bg))
+            if room > 3:
+                self.put(yy, x, p["cmd"][:room], self.col(BRIGHT if selected else DIM, bg))
 
         # ── footer ──
         keys = [("q", "Quit"), ("c", "CPU"), ("m", "Mem"), ("p", "PID"), ("n", "Name"), ("r", "Reverse"),
                 ("↑↓", "Select"), ("k", "Kill"), ("K", "Force kill"), ("+/-", "Interval")]
+        if self.new_version:
+            keys.insert(0, ("u", "Update"))
         self.put(h - 1, 0, " " * w, self.col(TEXT, 236))
         x = 1
         for k, d in keys:
@@ -656,7 +810,7 @@ class App:
         if self.msg and time.time() - self.msg_t < 3:
             self.put(h - 1, max(0, w - len(self.msg) - 1), self.msg, self.col(BRIGHT, 161, curses.A_BOLD))
         else:
-            iv = f" every {self.interval:.1f}s "
+            iv = f" v{VERSION} · {self.interval:.1f}s "
             self.put(h - 1, w - len(iv) - 1, iv, self.col(16, 120, curses.A_BOLD))
         s.refresh()
 
@@ -702,14 +856,31 @@ class App:
                 elif k == ord("K"): self.kill(signal.SIGKILL)
                 elif k == ord("+"): self.interval = min(10, self.interval + 0.5)
                 elif k == ord("-"): self.interval = max(0.5, self.interval - 0.5)
+                elif k in (ord("u"), ord("U")):
+                    self.install_update()
+                    if self.restart:
+                        return
                 self.draw()
             self.update()
             last = time.time()
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
+        print(f"SimpleTskMgr {VERSION}")
+        return
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(lambda scr: App(scr).run())
+    app = {}
+
+    def start(scr):
+        app["a"] = App(scr)
+        app["a"].run()
+
+    curses.wrapper(start)
+    if app.get("a") and app["a"].restart:  # updated -> start the new version
+        print(f"SimpleTskMgr updated to v{app['a'].new_version}, restarting...")
+        path = os.path.realpath(__file__)
+        os.execv(sys.executable, [sys.executable, path] + sys.argv[1:])
 
 
 if __name__ == "__main__":
