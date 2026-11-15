@@ -29,9 +29,11 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "RealCat1st/simpletskmgr"
 RAW_URL = f"https://raw.githubusercontent.com/{REPO}/main/simpletskmgr.py"
+IN_SNAP = bool(os.environ.get("SNAP"))  # snaps update themselves via "snap refresh"
+HOSTFS = "/var/lib/snapd/hostfs" if IN_SNAP and os.path.isdir("/var/lib/snapd/hostfs") else ""
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -216,14 +218,21 @@ class Disk:
 
     def mounts(self):
         seen, out = set(), []
-        for line in read("/proc/mounts").splitlines():
+        # inside a snap our own mount table is the sandbox -> use the host's (pid 1)
+        table = (read("/proc/1/mounts") if IN_SNAP else "") or read("/proc/mounts")
+        for line in table.splitlines():
             dev, mnt, fs = line.split()[:3]
             mnt = mnt.replace("\\040", " ")
-            if fs in self.SKIP or dev in seen or mnt.startswith(("/snap", "/var/lib/docker")):
+            if fs in self.SKIP or dev in seen or mnt.startswith(("/snap", "/var/lib/docker", "/var/lib/snapd")):
                 continue
-            try:
-                st = os.statvfs(mnt)
-            except Exception:
+            st = None
+            for path in ([HOSTFS + mnt] if HOSTFS else []) + [mnt]:
+                try:
+                    st = os.statvfs(path)
+                    break
+                except Exception:
+                    pass
+            if st is None:
                 continue
             total = st.f_blocks * st.f_frsize
             if total == 0:
@@ -410,7 +419,7 @@ class App:
         self.query, self.searching = "", False
         self.new_version = None
         self.restart = False
-        if not os.environ.get("STM_NO_UPDATE_CHECK"):
+        if not os.environ.get("STM_NO_UPDATE_CHECK") and not IN_SNAP:
             threading.Thread(target=self.check_update, daemon=True).start()
         self.distro = "Linux"
         for line in read("/etc/os-release").splitlines():
@@ -441,6 +450,9 @@ class App:
             pass  # offline etc. – just skip
 
     def install_update(self):
+        if IN_SNAP:
+            self.msg, self.msg_t = " Snap updates automatically (sudo snap refresh simpletskmgr) ", time.time()
+            return
         if not self.new_version:
             self.msg, self.msg_t = " You are on the latest version ", time.time()
             return

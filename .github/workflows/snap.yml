@@ -1,0 +1,43 @@
+name: Snap
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    env:
+      HAS_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@v1
+
+      - name: Smoke test (install and run)
+        run: |
+          sudo snap install --dangerous ${{ steps.build.outputs.snap }}
+          simpletskmgr --version
+          # run the UI for 3 seconds in a pseudo terminal, must not crash
+          TERM=xterm-256color script -qec "timeout 3 simpletskmgr" /dev/null < /dev/null || [ $? -eq 124 ]
+
+      - name: Upload snap as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simpletskmgr-snap
+          path: ${{ steps.build.outputs.snap }}
+
+      # every push to main -> "edge" channel, every GitHub release -> "stable"
+      - name: Publish to Snap Store
+        if: env.HAS_STORE_CREDENTIALS == 'true'
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ github.event_name == 'release' && 'stable' || 'edge' }}

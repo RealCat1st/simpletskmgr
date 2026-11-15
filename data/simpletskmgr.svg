@@ -1,11 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <rect x="4" y="4" width="120" height="120" rx="26" fill="#1c1c1c"/>
-  <circle cx="64" cy="64" r="38" fill="none" stroke="#3a3a3a" stroke-width="12"/>
-  <circle cx="64" cy="64" r="38" fill="none" stroke="url(#g)" stroke-width="12"
-          stroke-linecap="round" stroke-dasharray="167 239" transform="rotate(-90 64 64)"/>
-  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="#00e6a0"/><stop offset="0.6" stop-color="#ffd700"/><stop offset="1" stop-color="#ff3b3b"/>
-  </linearGradient></defs>
-  <rect x="48" y="58" width="32" height="5" rx="2.5" fill="#e8e8e8"/>
-  <rect x="48" y="68" width="22" height="5" rx="2.5" fill="#9a9a9a"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2d31"/>
+      <stop offset="1" stop-color="#121214"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00f0a8"/>
+      <stop offset="0.55" stop-color="#c8f000"/>
+      <stop offset="1" stop-color="#ffb000"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00e0ff"/>
+      <stop offset="1" stop-color="#00f0a8"/>
+    </linearGradient>
+    <linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd000"/>
+      <stop offset="1" stop-color="#ff4060"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)" filter="url(#shadow)"/>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#shine)"/>
+  <rect x="16.5" y="16.5" width="223" height="223" rx="51.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+
+  <!-- ring tracks -->
+  <g fill="none" stroke="#3a3c42" stroke-width="14">
+    <circle cx="128" cy="128" r="80"/>
+    <circle cx="128" cy="128" r="58"/>
+    <circle cx="128" cy="128" r="36"/>
+  </g>
+
+  <!-- ring values (start at 12 o'clock, clockwise) -->
+  <g fill="none" stroke-width="14" stroke-linecap="round" transform="rotate(-90 128 128)" filter="url(#glow)">
+    <!-- CPU 72%  : 2π·80 = 502.7 -->
+    <circle cx="128" cy="128" r="80" stroke="url(#g1)" stroke-dasharray="362 503"/>
+    <!-- GPU 48%  : 2π·58 = 364.4 -->
+    <circle cx="128" cy="128" r="58" stroke="url(#g2)" stroke-dasharray="175 365"/>
+    <!-- RAM 85%  : 2π·36 = 226.2 -->
+    <circle cx="128" cy="128" r="36" stroke="url(#g3)" stroke-dasharray="192 227"/>
+  </g>
+
+  <!-- terminal prompt in the centre -->
+  <g stroke="#f2f2f2" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <polyline points="114,118 124,128 114,138"/>
+    <line x1="129" y1="139" x2="142" y2="139"/>
+  </g>
 </svg>

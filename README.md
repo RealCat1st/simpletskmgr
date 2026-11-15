@@ -43,6 +43,22 @@ cd simpletskmgr
 ./simpletskmgr.py
 ```
 
+### Snap
+
+```sh
+sudo snap install simpletskmgr
+```
+
+Some features need permissions that snaps don't get automatically:
+
+```sh
+sudo snap connect simpletskmgr:hardware-observe   # GPU / NPU / temperatures
+sudo snap connect simpletskmgr:mount-observe      # disk usage
+sudo snap connect simpletskmgr:process-control    # kill processes
+```
+
+The snap updates itself automatically, the in-app update check is disabled there.
+
 ### Uninstall
 
 ```sh

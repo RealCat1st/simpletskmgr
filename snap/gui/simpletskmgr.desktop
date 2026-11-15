@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SimpleTskMgr
+GenericName=Task Manager
+Comment=Monitor CPU, GPU, memory, disks and processes
+Exec=simpletskmgr
+Icon=${SNAP}/meta/gui/icon.png
+Terminal=true
+Categories=System;Monitor;ConsoleOnly;
+Keywords=task;manager;process;monitor;cpu;gpu;ram;memory;top;
